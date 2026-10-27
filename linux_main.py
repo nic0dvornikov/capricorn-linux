@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import subprocess
+from external_process import external_env
 import sys
 import tempfile
 import threading
@@ -103,7 +104,7 @@ class LocalSpeaker:
     def _play(self, command, timeout, cancel):
         if cancel.is_set():
             return
-        self.process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.process = subprocess.Popen(command, env=external_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + timeout
         while self.process.poll() is None:
             if cancel.wait(0.05) or time.monotonic() >= deadline:

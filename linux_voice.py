@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import subprocess
+from external_process import external_env
 import threading
 import time
 from pathlib import Path
@@ -51,7 +52,7 @@ class LinuxListener(threading.Thread):
                 raise RuntimeError("Не найден pw-record или arecord для микрофона")
             model = vosk.Model(str(self.model_path))
             recognizer = vosk.KaldiRecognizer(model, RATE)
-            self.process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            self.process = subprocess.Popen(command, env=external_env(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                             bufsize=0)
             log.info("Микрофон подключён через %s", command[0])
             while not self.stop_req.is_set():

@@ -8,6 +8,7 @@ import random
 import re
 import shutil
 import subprocess
+from external_process import external_env
 import tempfile
 import threading
 import time
@@ -275,7 +276,7 @@ class LocalAI:
             try:
                 command = exe if exe and os.path.exists(exe) else "ollama"
                 options = {"creationflags": NO_WINDOW} if os.name == "nt" else {}
-                subprocess.Popen([command, "serve"], **options)
+                subprocess.Popen([command, "serve"], env=external_env(), **options)
             except OSError:
                 log.info("Ollama не установлена")
                 return

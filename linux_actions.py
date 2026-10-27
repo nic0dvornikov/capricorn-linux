@@ -10,8 +10,11 @@ import os
 import re
 import shutil
 import subprocess
+from external_process import external_env
 import urllib.parse
-import webbrowser
+import logging
+
+log = logging.getLogger("capri")
 from pathlib import Path
 
 
@@ -22,7 +25,7 @@ class LinuxActions:
     @staticmethod
     def _run(args: list[str]) -> bool:
         try:
-            return subprocess.run(args, check=False, timeout=8).returncode == 0
+            return subprocess.run(args, check=False, timeout=8, env=external_env()).returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -126,8 +129,7 @@ class LinuxActions:
         search = re.match(r"(?:найди|поищи|загугли|погугли|узнай)\s+(?:в интернете\s+)?(.+)", text)
         if search:
             url = "https://www.google.com/search?q=" + urllib.parse.quote_plus(search.group(1))
-            webbrowser.open(url)
-            return "Открыла поиск в браузере."
+            return "Открыла поиск в браузере." if self._open_url(url) else "Не получилось открыть браузер."
 
         open_match = re.match(r"(?:открой|запусти|перейди на|зайди на)\s+(.+)", text)
         if open_match:
@@ -139,11 +141,9 @@ class LinuxActions:
                 "телеграм": "tg://", "telegram": "tg://",
             }
             if target in sites:
-                webbrowser.open(sites[target])
-                return f"Открываю {target}."
+                return f"Открываю {target}." if self._open_url(sites[target]) else "Не получилось открыть браузер или приложение."
             if re.fullmatch(r"[\w.-]+\.[a-zа-я]{2,}(/\S*)?", target):
-                webbrowser.open("https://" + target)
-                return f"Открываю {target}."
+                return f"Открываю {target}." if self._open_url("https://" + target) else "Не получилось открыть браузер."
             app_aliases = {
                 "файлы": ("dolphin",), "проводник": ("dolphin",),
                 "терминал": ("konsole",), "консоль": ("konsole",),
@@ -165,10 +165,26 @@ class LinuxActions:
         return None
 
     @staticmethod
+    def _open_url(url):
+        command = shutil.which("xdg-open")
+        if not command:
+            log.error("xdg-open is unavailable")
+            return False
+        try:
+            result = subprocess.run([command, url], env=external_env(), capture_output=True,
+                                    text=True, timeout=10)
+            if result.returncode:
+                log.error("URL opener failed: %s", result.stderr[-2000:])
+            return result.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            log.exception("Unable to launch URL opener")
+            return False
+
+    @staticmethod
     def _spawn(args: list[str]) -> bool:
         try:
             subprocess.Popen(args, start_new_session=True, stdout=subprocess.DEVNULL,
-                             stderr=subprocess.DEVNULL)
+                             stderr=subprocess.DEVNULL, env=external_env())
             return True
         except OSError:
             return False
