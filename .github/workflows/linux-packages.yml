@@ -54,4 +54,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: capricorn-linux-packages
-          path: build/packages/*
+          path: |
+            build/packages/*.deb
+            build/packages/*.rpm
+            build/packages/*.AppImage
