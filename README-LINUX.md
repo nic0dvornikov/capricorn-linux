@@ -15,11 +15,11 @@
 2. В каталоге проекта выполнить:
 
    ```bash
-   ./setup-linux.sh
-   ./run-linux.sh
+   bash setup-linux.sh
+   bash run-linux.sh
    ```
 
-   Чтобы добавить Капри в меню приложений KDE, выполни `./install-linux.sh`.
+   Чтобы добавить Капри в меню приложений KDE, выполни `bash install-linux.sh`.
 
 3. В Ollama должна быть локальная модель. По умолчанию используется `qwen3.5:9b`; модель можно поменять в `~/.config/capricorn/config.json`.
 

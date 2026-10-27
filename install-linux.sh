@@ -8,7 +8,7 @@ cat > "$APP_DIR/capricorn.desktop" <<EOF
 Type=Application
 Name=Капри
 Comment=Локальный голосовой помощник
-Exec=$ROOT/run-linux.sh
+Exec=/usr/bin/env bash "$ROOT/run-linux.sh"
 Path=$ROOT
 Icon=$ROOT/assets/poses/capri.png
 Terminal=false
