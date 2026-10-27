@@ -6,14 +6,19 @@ import logging
 import os
 import random
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 import urllib.request
+from pathlib import Path
 
 from persona import CHARACTER, SPEECH_RULES, user_context
 
 log = logging.getLogger("capri")
 URL = "http://127.0.0.1:11434"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "capricorn"
+MEMORY_PATH = STATE_DIR / "memory.json"
 NO_WINDOW = 0x08000000
 SEARCH_MARK = "ПОИСК"
 NO_THINKING = "Сразу дай готовый ответ от лица Капри. Без рассуждений, без анализа вопроса, без «пользователь хочет»."
@@ -21,15 +26,23 @@ NO_THINKING = "Сразу дай готовый ответ от лица Кап�
 SYSTEM = f"""{CHARACTER}
 
 {SPEECH_RULES}
-Отвечай на любые вопросы о науке, истории, технике, языке, о себе, советы и просьбы рассказать что-то.
-Только если вопрос про текущие события (погода сейчас, свежие новости, курсы валют, цены,
-результаты недавних матчей), ответь ровно одним словом: {SEARCH_MARK}"""
+Отвечай прямо на вопрос и выполняй просьбу по существу. Если пользователь исправляет тебя,
+прими поправку и ответь заново по уточнённому смыслу, не спорь и не повторяй прежнюю ошибку.
+Если вопрос неоднозначен, сначала используй контекст беседы; переспрашивай только когда без уточнения
+нельзя дать полезный ответ. Если точного факта не знаешь, честно скажи об этом и не угадывай.
+Не обесценивай тему пользователя, не переводи разговор на другую тему и не добавляй случайные вопросы.
+Для текущих событий, погоды, свежих новостей, курсов, цен и недавних результатов не выдумывай данные:
+кратко скажи, что нужен поиск в интернете, и предложи пользователю попросить поиск."""
 
 FRESH = re.compile(r"погод|новост|курс (доллар|евро|рубл|валют|биткоин)|сколько стоит|цена|цены|"
                    r"счет матча|кто выиграл|расписани|пробк|сегодня в мире")
 
 
 FOREIGN = re.compile(r"[　-鿿가-힯＀-￯]+")
+DEEP_QUESTION = re.compile(r"подумай|пошаг|подробно|проанализ|сравни|разбери|план действий|реши задачу|"
+                           r"помоги выбрать|почему|докажи|рассчитай", re.I)
+REMEMBER = re.compile(r"^\s*(?:капри[, ]+)?запомни\s*(?:,?\s*что\s*)?[:,-]?\s*(.+?)\s*[.!?]*\s*$", re.I)
+FORGET_ONE = re.compile(r"^\s*(?:капри[, ]+)?забудь\s*(?:,?\s*что\s*)?[:,-]?\s*(.+?)\s*[.!?]*\s*$", re.I)
 
 
 THIRD_PERSON = re.compile(r"(одн(а|ой|у|у) прекрасн(ая|ой|ую) (я|мне|меня|мной))", re.IGNORECASE)
@@ -131,7 +144,7 @@ def _post(path, payload, timeout):
 
 
 # какую модель взять, если указанной в настройках нет: сначала проверенные, «думающие» — в последнюю очередь
-PREFERRED = ["qwen3:14b", "qwen3:8b", "qwen3:4b-instruct", "qwen3:4b-instruct-2507", "qwen3:1.7b", "qwen2.5",
+PREFERRED = ["qwen3.5:9b", "qwen3:14b", "qwen3:8b", "qwen3:4b-instruct", "qwen3:4b-instruct-2507", "qwen3:1.7b", "qwen2.5",
              "gemma3", "llama3"]
 
 
@@ -152,9 +165,75 @@ def pick_model(names):
 
 class LocalAI:
     def __init__(self, cfg):
-        self.model = cfg.get("local_model", "qwen3:8b")
+        self.model = cfg.get("local_model", "qwen3.5:9b")
+        self.think_mode = bool(cfg.get("think_mode", False))
+        self.memory = []
         self.history = []
+        self._load_saved_state()
         self.on_model_change = None  # main записывает новую модель в config.json
+
+    def _load_saved_state(self):
+        try:
+            saved = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+            self.memory = [str(item)[:500] for item in saved.get("facts", []) if str(item).strip()][-50:]
+            self.history = [item for item in saved.get("history", []) if isinstance(item, dict)
+                            and item.get("role") in {"user", "assistant"} and item.get("content")][-40:]
+        except (OSError, ValueError, TypeError, AttributeError):
+            self.memory, self.history = [], []
+
+    def _save_state(self):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {"facts": self.memory, "history": self.history[-40:]}
+        fd, temporary = tempfile.mkstemp(prefix="memory-", suffix=".json", dir=STATE_DIR)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as file:
+                json.dump(payload, file, ensure_ascii=False, indent=2)
+                file.write("\n")
+            os.replace(temporary, MEMORY_PATH)
+            os.chmod(MEMORY_PATH, 0o600)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def memory_summary(self):
+        facts = "\n".join(f"• {fact}" for fact in self.memory) or "Пока сохранённых заметок нет."
+        turns = sum(item["role"] == "user" for item in self.history)
+        return f"Запомненные сведения:\n{facts}\n\nСохранено реплик пользователя: {turns}."
+
+    def clear_memory(self):
+        self.memory.clear()
+        self.history.clear()
+        self._save_state()
+
+    def _memory_command(self, question):
+        normalized = question.strip().lower().replace("ё", "е").strip(" .,!?\"")
+        if normalized in {"что ты помнишь обо мне", "что ты обо мне помнишь", "покажи память",
+                          "покажи что ты запомнила", "покажи, что ты запомнила"}:
+            return self.memory_summary()
+        if normalized in {"забудь все", "забудь все обо мне", "очисти память"}:
+            self.clear_memory()
+            return "Очистила сохранённые заметки и историю разговоров."
+        match = REMEMBER.match(question)
+        if match:
+            fact = match.group(1).strip()[:500]
+            if not fact:
+                return "Скажи, что именно мне запомнить."
+            if fact.casefold() not in {item.casefold() for item in self.memory}:
+                self.memory.append(fact)
+                self.memory = self.memory[-50:]
+                self._save_state()
+            return "Запомнила. Эти заметки хранятся только в локальном файле на компьютере."
+        match = FORGET_ONE.match(question)
+        if match:
+            fact = match.group(1).strip().casefold()
+            remaining = [item for item in self.memory if fact not in item.casefold()]
+            removed = len(remaining) != len(self.memory)
+            self.memory = remaining
+            if removed:
+                self._save_state()
+            return "Забыла эту заметку." if removed else "Такой заметки у меня нет."
+        return None
 
     @staticmethod
     def installed():
@@ -173,10 +252,13 @@ class LocalAI:
         в настройках модели нет, а другая скачана — переключается на неё и запоминает."""
         names = self.installed()
         if names is None:
-            exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe")
+            exe = shutil.which("ollama")
+            if os.name == "nt" and not exe:
+                exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe")
             try:
-                subprocess.Popen([exe if os.path.exists(exe) else "ollama", "serve"],
-                                 creationflags=NO_WINDOW)
+                command = exe if exe and os.path.exists(exe) else "ollama"
+                options = {"creationflags": NO_WINDOW} if os.name == "nt" else {}
+                subprocess.Popen([command, "serve"], **options)
             except OSError:
                 log.info("Ollama не установлена")
                 return
@@ -203,41 +285,53 @@ class LocalAI:
         except Exception as e:
             log.info("Не удалось прогреть модель: %s", e)
 
-    def _chat(self, messages, max_tokens=300):
+    def _chat(self, messages, max_tokens=500, think=None):
+        use_thinking = self.think_mode if think is None else think
         resp = _post("/api/chat", {
             "model": self.model,
             "messages": messages,
             "stream": False,
-            "think": False,  # Qwen3 по умолчанию «рассуждает» вслух — для голоса это лишняя задержка
+            "think": use_thinking,
             "keep_alive": "10m",
-            "options": {"num_predict": max_tokens, "temperature": 0.6, "repeat_penalty": 1.15},
-        }, 120)
+            "options": {"num_ctx": 8192, "num_predict": 1400 if use_thinking else max_tokens,
+                        "temperature": 0.45, "repeat_penalty": 1.08},
+        }, 240 if use_thinking else 120)
         text = strip_reasoning(resp.get("message", {}).get("content", ""))
         if REASONING.search(text):
             # модель всё равно «думает» вслух — переспрашиваем, а если опять, ответа нет
             log.info("Модель %s рассуждает вслух вместо ответа", self.model)
             if messages[-1].get("content", "").startswith(NO_THINKING):
                 return ""
-            return self._chat(messages + [{"role": "system", "content": NO_THINKING}], max_tokens)
+            return self._chat(messages + [{"role": "system", "content": NO_THINKING}], max_tokens, think=False)
         return text
 
     def ask(self, question):
         """Текст ответа или None, если лучше открыть поиск."""
-        if FRESH.search(question.lower()):
-            return None
+        memory_reply = self._memory_command(question)
+        if memory_reply is not None:
+            return memory_reply
+        needs_live_data = bool(FRESH.search(question.lower()))
         now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
         self.history.append({"role": "user", "content": question})
-        self.history = self.history[-6:]
-        messages = [{"role": "system", "content": SYSTEM + "\n" + user_context() + f"\nСейчас {now}."}] + self.history
+        self.history = self.history[-40:]
+        live_rule = ("Для этого запроса нужны актуальные данные. Не отвечай фактами из памяти и не угадывай. "
+                     "Коротко скажи, что сейчас не подключён веб-поиск, и посоветуй попросить: «найди в интернете …».\n"
+                     if needs_live_data else "")
+        remembered = ("\nСведения, которые пользователь попросил запомнить:\n" +
+                      "\n".join(f"- {fact}" for fact in self.memory) if self.memory else "")
+        messages = [{"role": "system", "content": SYSTEM + "\n" + live_rule + user_context() +
+                     remembered + f"\nСейчас {now}."}] + self.history
+        think = self.think_mode or bool(DEEP_QUESTION.search(question))
         try:
-            answer = self._chat(messages)
+            answer = self._chat(messages, think=think)
             if FOREIGN.search(answer):  # Qwen иногда срывается на китайский — пробуем ещё раз
                 answer = self._chat(messages + [{"role": "system", "content":
-                                    "Ответь заново, строго только русскими буквами, без иероглифов."}])
+                                    "Ответь заново, строго только русскими буквами, без иероглифов."}], think=think)
             answer = re.sub(r"\s+", " ", FOREIGN.sub("", answer)).strip()
         except Exception as e:
             log.info("Локальная модель недоступна: %s", e)
             self.history.pop()
+            self._save_state()
             return None
         recent = [m["content"] for m in self.history if m["role"] == "assistant"]
         answer = naturalize(drop_repeats(drop_third_person(answer), self.history), question, recent)
@@ -245,11 +339,12 @@ class LocalAI:
         answer = re.sub(r"[\U0001F000-\U0001FAFF☀-➿️]", "", answer)  # эмодзи
         answer = re.sub(r"\s+", " ", answer).strip()
         answer = answer[:1].upper() + answer[1:]
-        broken = len(answer) < 40 and not re.search(r"[.!?…]$", answer)
-        if not answer or broken or SEARCH_MARK in answer.upper()[:20]:
+        if not answer or SEARCH_MARK in answer.upper()[:20]:
             self.history.pop()
+            self._save_state()
             return None
         self.history.append({"role": "assistant", "content": answer})
+        self._save_state()
         return answer
 
     def chatter(self):
