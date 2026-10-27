@@ -46,14 +46,14 @@ cp "$APPDIR/capricorn.png" "$PAYLOAD/usr/share/icons/hicolor/256x256/apps/capric
 
 fpm -s dir -t deb -n capricorn -v "$VERSION" --architecture amd64 \
   --description "Local voice assistant Capri" --license MIT \
-  --depends libgl1 --depends libxkbcommon0 --depends libxkbcommon-x11-0 --depends libxcb-cursor0 \
+  --depends libgl1 --depends libegl1 --depends libxkbcommon0 --depends libxkbcommon-x11-0 --depends libxcb-cursor0 \
   --depends libxcb-icccm4 --depends libxcb-image0 --depends libxcb-keysyms1 --depends libxcb-randr0 \
   --depends libxcb-render-util0 --depends libxcb-shape0 --depends libxcb-xfixes0 --depends libxcb-xinerama0 \
   --depends libxcb-xkb1 --depends libx11-xcb1 --depends libsm6 --depends libdbus-1-3 --depends espeak-ng \
   -C "$PAYLOAD" -p "$BUILD_DIR/capricorn_${VERSION}_amd64.deb" .
 fpm -s dir -t rpm -n capricorn -v "$VERSION" --architecture x86_64 \
   --description "Local voice assistant Capri" --license MIT \
-  --depends mesa-libGL --depends libxkbcommon --depends libxkbcommon-x11 --depends libxcb \
+  --depends mesa-libGL --depends libglvnd-egl --depends libxkbcommon --depends libxkbcommon-x11 --depends libxcb \
   --depends libX11-xcb --depends libSM --depends glib2 --depends dbus-libs --depends espeak-ng \
   -C "$PAYLOAD" -p "$BUILD_DIR/capricorn-${VERSION}-1.x86_64.rpm" .
 
