@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal, Qt
@@ -24,6 +25,9 @@ from local_ai import LocalAI
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "capricorn"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "capricorn"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "capricorn"
+MODEL_DIR = DATA_DIR / "models" / "vosk-model-small-ru-0.22"
+VOICE_DIR = DATA_DIR / "voices"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = STATE_DIR / "capri.log"
 DEFAULTS = {
@@ -38,7 +42,8 @@ DEFAULTS = {
 }
 
 VOICE_PRESETS = {
-    "piper_irina": {"label": "Нейроголос Ирина (Piper)", "engine": "piper"},
+    "piper_irina": {"label": "Нейроголос Ирина (Piper)", "engine": "piper",
+                    "voice": "ru+f2", "rate": 150, "pitch": 44, "volume": 62},
     "soft_female": {"label": "Мягкий женский", "voice": "ru+f2", "rate": 150, "pitch": 44, "volume": 62},
     "clear_female": {"label": "Женский повыше", "voice": "ru+f3", "rate": 155, "pitch": 50, "volume": 65},
     "calm_male": {"label": "Спокойный низкий", "voice": "ru+m2", "rate": 150, "pitch": 38, "volume": 62},
@@ -63,6 +68,8 @@ class LocalSpeaker:
     def __init__(self, cfg):
         self.process = None
         self.temp_audio = None
+        self._piper_voice = None
+        self._piper_model = None
         self.apply_preset(cfg.get("tts_preset", "piper_irina"))
 
     def apply_preset(self, preset):
@@ -82,24 +89,27 @@ class LocalSpeaker:
     def say(self, text: str):
         self.stop()
         if self.preset == "piper_irina":
-            model = ROOT / "voices" / "ru_RU-irina-medium.onnx"
+            model = VOICE_DIR / "ru_RU-irina-medium.onnx"
+            if not model.is_file():
+                model = ROOT / "voices" / "ru_RU-irina-medium.onnx"
             player = shutil.which("pw-play") or shutil.which("paplay")
             if model.is_file() and player:
                 try:
+                    from piper import PiperVoice, SynthesisConfig
+                    if self._piper_voice is None or self._piper_model != model:
+                        self._piper_voice = PiperVoice.load(str(model))
+                        self._piper_model = model
                     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as audio:
                         self.temp_audio = audio.name
-                    self.process = subprocess.Popen(
-                        [sys.executable, "-m", "piper", "-m", str(model), "-f", self.temp_audio,
-                         "--volume", "0.72", text],
-                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    with wave.open(self.temp_audio, "wb") as wav_file:
+                        self._piper_voice.synthesize_wav(
+                            text, wav_file, syn_config=SynthesisConfig(volume=0.72))
+                    self.process = subprocess.Popen([player, self.temp_audio],
+                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     self.process.wait(timeout=max(20, len(text) / 3))
-                    if self.process.returncode == 0:
-                        self.process = subprocess.Popen([player, self.temp_audio],
-                                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                        self.process.wait(timeout=max(20, len(text) / 3))
                     self.stop()
                     return
-                except (OSError, subprocess.TimeoutExpired):
+                except Exception:
                     self.stop()
         binary = shutil.which("espeak-ng") or shutil.which("espeak")
         if not binary:
@@ -137,10 +147,10 @@ class CapriLinux(QObject):
         threading.Thread(target=self.local.start_server, name="ollama-warmup", daemon=True).start()
         try:
             from linux_voice import LinuxListener
-            model = ROOT / "models" / "vosk-model-small-ru-0.22"
+            model = MODEL_DIR
             if not (model / "am/final.mdl").is_file():
-                log.warning("Vosk model is missing; run ./setup-linux.sh")
-                self.avatar.set_subtitle("МИКРОФОН: НУЖНО ЗАПУСТИТЬ setup-linux.sh")
+                log.warning("Vosk model is missing; run bash setup-linux.sh")
+                self.avatar.set_subtitle("МИКРОФОН: ЗАПУСТИ bash setup-linux.sh")
                 return
             self.listener = LinuxListener(str(model),
                                           lambda text, _audio: self.bridge.final_text.emit(text),
@@ -325,6 +335,17 @@ def tray_icon():
 
 
 def main():
+    # Package files are read-only; extract the bundled offline model into the
+    # user's XDG data directory on first launch.
+    model_file = MODEL_DIR / "am" / "final.mdl"
+    if not model_file.is_file():
+        archive = ROOT / "bundled" / "vosk-model-small-ru-0.22.zip"
+        if archive.is_file():
+            import zipfile
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(archive) as bundle:
+                bundle.extractall(MODEL_DIR.parent)
+
     app = QApplication(sys.argv)
     app.setApplicationName("Capricorn")
     app.setQuitOnLastWindowClosed(False)

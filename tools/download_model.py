@@ -15,7 +15,7 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 NAME = "vosk-model-small-ru-0.22"
 URL = f"https://alphacephei.com/vosk/models/{NAME}.zip"
 BUNDLED = os.path.join(BASE, "bundled", NAME + ".zip")  # копия модели в репозитории (лицензия Apache 2.0)
-MODELS = os.path.join(BASE, "models")
+MODELS = os.environ.get("CAPRICORN_MODELS_DIR", os.path.join(BASE, "models"))
 TARGET = os.path.join(MODELS, NAME)
 
 

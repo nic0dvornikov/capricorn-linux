@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Capri
+Name[ru]=Капри
+Comment=Local voice assistant
+Comment[ru]=Локальный голосовой помощник
+Exec=capricorn
+Icon=capricorn
+Terminal=false
+Categories=Utility;Accessibility;
+StartupNotify=false
