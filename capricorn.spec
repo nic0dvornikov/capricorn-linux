@@ -4,11 +4,12 @@ from PyInstaller.utils.hooks import collect_all
 datas = [("assets", "assets"), ("bundled", "bundled")]
 binaries = []
 hiddenimports = []
-for package in ("PySide6", "vosk"):
-    package_datas, package_binaries, package_hidden = collect_all(package)
-    datas += package_datas
-    binaries += package_binaries
-    hiddenimports += package_hidden
+# Let PyInstaller's Qt hooks collect only the PySide6 modules and plugins
+# imported by the app. collect_all("PySide6") would bundle every Qt module.
+package_datas, package_binaries, package_hidden = collect_all("vosk")
+datas += package_datas
+binaries += package_binaries
+hiddenimports += package_hidden
 
 a = Analysis(
     ["linux_main.py"],
