@@ -395,7 +395,25 @@ def main():
     return app.exec()
 
 
+def check_render():
+    """Exercise the packaged Qt bindings without microphone, AI or user settings."""
+    app = QApplication([sys.argv[0]])
+    avatar = Avatar(str(ROOT / "assets"))
+    avatar.timer.stop()
+    avatar.state = "visible"
+    for frame in range(1200):
+        avatar.t = frame
+        avatar.set_mode(("idle", "thinking", "speaking")[(frame // 400) % 3])
+        avatar.render()
+        app.processEvents()
+    avatar.close()
+    print("Avatar rendering check passed", flush=True)
+    return 0
+
+
 if __name__ == "__main__":
+    if "--check-render" in sys.argv:
+        raise SystemExit(check_render())
     try:
         raise SystemExit(main())
     except Exception:
