@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
 from pathlib import Path
@@ -167,6 +168,8 @@ class LocalAI:
     def __init__(self, cfg):
         self.model = cfg.get("local_model", "qwen3.5:9b")
         self.think_mode = bool(cfg.get("think_mode", False))
+        self._memory_lock = threading.RLock()
+        self._memory_generation = 0
         self.memory = []
         self.history = []
         self._load_saved_state()
@@ -182,58 +185,72 @@ class LocalAI:
             self.memory, self.history = [], []
 
     def _save_state(self):
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {"facts": self.memory, "history": self.history[-40:]}
-        fd, temporary = tempfile.mkstemp(prefix="memory-", suffix=".json", dir=STATE_DIR)
-        try:
-            os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
-                file.write("\n")
-            os.replace(temporary, MEMORY_PATH)
-            os.chmod(MEMORY_PATH, 0o600)
-        finally:
-            if os.path.exists(temporary):
-                os.unlink(temporary)
+        with self._memory_lock:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            payload = {"facts": self.memory, "history": self.history[-40:]}
+            fd, temporary = tempfile.mkstemp(prefix="memory-", suffix=".json", dir=STATE_DIR)
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as file:
+                    json.dump(payload, file, ensure_ascii=False, indent=2)
+                    file.write("\n")
+                os.replace(temporary, MEMORY_PATH)
+                os.chmod(MEMORY_PATH, 0o600)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
 
     def memory_summary(self):
-        facts = "\n".join(f"• {fact}" for fact in self.memory) or "Пока сохранённых заметок нет."
-        turns = sum(item["role"] == "user" for item in self.history)
-        return f"Запомненные сведения:\n{facts}\n\nСохранено реплик пользователя: {turns}."
+        with self._memory_lock:
+            facts = "\n".join(f"• {fact}" for fact in self.memory) or "Пока сохранённых заметок нет."
+            turns = sum(item["role"] == "user" for item in self.history)
+            return f"Запомненные сведения:\n{facts}\n\nСохранено реплик пользователя: {turns}."
+
+    def memory_generation(self):
+        with self._memory_lock:
+            return self._memory_generation
 
     def clear_memory(self):
-        self.memory.clear()
-        self.history.clear()
-        self._save_state()
+        with self._memory_lock:
+            self._memory_generation += 1
+            self.memory.clear()
+            self.history.clear()
+            self._save_state()
 
     def _memory_command(self, question):
+        with self._memory_lock:
+            normalized = question.strip().lower().replace("ё", "е").strip(" .,!?\"")
+            if normalized in {"что ты помнишь обо мне", "что ты обо мне помнишь", "покажи память",
+                              "покажи что ты запомнила", "покажи, что ты запомнила"}:
+                return self.memory_summary()
+            if self.is_clear_memory_request(question):
+                return "Подтверди очистку через меню «Память Capri → Очистить заметки и историю…»."
+            match = REMEMBER.match(question)
+            if match:
+                fact = match.group(1).strip()[:500]
+                if not fact:
+                    return "Скажи, что именно мне запомнить."
+                if fact.casefold() not in {item.casefold() for item in self.memory}:
+                    self.memory.append(fact)
+                    self.memory = self.memory[-50:]
+                    self._save_state()
+                return "Запомнила. Эти заметки хранятся только в локальном файле на компьютере."
+            match = FORGET_ONE.match(question)
+            if match:
+                fact = match.group(1).strip().casefold()
+                remaining = [item for item in self.memory if fact not in item.casefold()]
+                removed = len(remaining) != len(self.memory)
+                self.memory = remaining
+                if removed:
+                    self._save_state()
+                return "Забыла эту заметку." if removed else "Такой заметки у меня нет."
+            return None
+
+    @staticmethod
+    def is_clear_memory_request(question):
         normalized = question.strip().lower().replace("ё", "е").strip(" .,!?\"")
-        if normalized in {"что ты помнишь обо мне", "что ты обо мне помнишь", "покажи память",
-                          "покажи что ты запомнила", "покажи, что ты запомнила"}:
-            return self.memory_summary()
-        if normalized in {"забудь все", "забудь все обо мне", "очисти память"}:
-            self.clear_memory()
-            return "Очистила сохранённые заметки и историю разговоров."
-        match = REMEMBER.match(question)
-        if match:
-            fact = match.group(1).strip()[:500]
-            if not fact:
-                return "Скажи, что именно мне запомнить."
-            if fact.casefold() not in {item.casefold() for item in self.memory}:
-                self.memory.append(fact)
-                self.memory = self.memory[-50:]
-                self._save_state()
-            return "Запомнила. Эти заметки хранятся только в локальном файле на компьютере."
-        match = FORGET_ONE.match(question)
-        if match:
-            fact = match.group(1).strip().casefold()
-            remaining = [item for item in self.memory if fact not in item.casefold()]
-            removed = len(remaining) != len(self.memory)
-            self.memory = remaining
-            if removed:
-                self._save_state()
-            return "Забыла эту заметку." if removed else "Такой заметки у меня нет."
-        return None
+        normalized = re.sub(r"^капри[, ]+", "", normalized)
+        return normalized in {"забудь все", "забудь все обо мне", "очисти память"}
 
     @staticmethod
     def installed():
@@ -306,46 +323,60 @@ class LocalAI:
         return text
 
     def ask(self, question):
-        """Текст ответа или None, если лучше открыть поиск."""
-        memory_reply = self._memory_command(question)
-        if memory_reply is not None:
-            return memory_reply
+        """Текст ответа или None; результаты запросов до очистки памяти отбрасываются."""
+        with self._memory_lock:
+            memory_reply = self._memory_command(question)
+            if memory_reply is not None:
+                return memory_reply
+            generation = self._memory_generation
+            request_turn = {"role": "user", "content": question}
+            self.history.append(request_turn)
+            self.history = self.history[-40:]
+            history = [dict(item) for item in self.history]
+            facts = list(self.memory)
         needs_live_data = bool(FRESH.search(question.lower()))
         now = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
-        self.history.append({"role": "user", "content": question})
-        self.history = self.history[-40:]
         live_rule = ("Для этого запроса нужны актуальные данные. Не отвечай фактами из памяти и не угадывай. "
                      "Коротко скажи, что сейчас не подключён веб-поиск, и посоветуй попросить: «найди в интернете …».\n"
                      if needs_live_data else "")
         remembered = ("\nСведения, которые пользователь попросил запомнить:\n" +
-                      "\n".join(f"- {fact}" for fact in self.memory) if self.memory else "")
+                      "\n".join(f"- {fact}" for fact in facts) if facts else "")
         messages = [{"role": "system", "content": SYSTEM + "\n" + live_rule + user_context() +
-                     remembered + f"\nСейчас {now}."}] + self.history
+                     remembered + f"\nСейчас {now}."}] + history
         think = self.think_mode or bool(DEEP_QUESTION.search(question))
         try:
+            # Never hold the memory lock while waiting for Ollama.
             answer = self._chat(messages, think=think)
-            if FOREIGN.search(answer):  # Qwen иногда срывается на китайский — пробуем ещё раз
+            with self._memory_lock:
+                if generation != self._memory_generation:
+                    return None
+            if FOREIGN.search(answer):
                 answer = self._chat(messages + [{"role": "system", "content":
                                     "Ответь заново, строго только русскими буквами, без иероглифов."}], think=think)
             answer = re.sub(r"\s+", " ", FOREIGN.sub("", answer)).strip()
         except Exception as e:
             log.info("Локальная модель недоступна: %s", e)
-            self.history.pop()
-            self._save_state()
+            with self._memory_lock:
+                if generation == self._memory_generation:
+                    self.history = [turn for turn in self.history if turn is not request_turn]
+                    self._save_state()
             return None
-        recent = [m["content"] for m in self.history if m["role"] == "assistant"]
-        answer = naturalize(drop_repeats(drop_third_person(answer), self.history), question, recent)
-        answer = re.sub(r"\s*\([^)]*\)", "", answer)                      # ремарки в скобках
-        answer = re.sub(r"[\U0001F000-\U0001FAFF☀-➿️]", "", answer)  # эмодзи
-        answer = re.sub(r"\s+", " ", answer).strip()
-        answer = answer[:1].upper() + answer[1:]
-        if not answer or SEARCH_MARK in answer.upper()[:20]:
-            self.history.pop()
+        with self._memory_lock:
+            if generation != self._memory_generation:
+                return None
+            recent = [m["content"] for m in history if m["role"] == "assistant"]
+            answer = naturalize(drop_repeats(drop_third_person(answer), history), question, recent)
+            answer = re.sub(r"\s*\([^)]*\)", "", answer)
+            answer = re.sub(r"[\U0001F000-\U0001FAFF☀-➿️]", "", answer)
+            answer = re.sub(r"\s+", " ", answer).strip()
+            answer = answer[:1].upper() + answer[1:]
+            if not answer or SEARCH_MARK in answer.upper()[:20]:
+                self.history = [turn for turn in self.history if turn is not request_turn]
+                self._save_state()
+                return None
+            self.history.append({"role": "assistant", "content": answer})
             self._save_state()
-            return None
-        self.history.append({"role": "assistant", "content": answer})
-        self._save_state()
-        return answer
+            return answer
 
     def chatter(self):
         """Короткая спонтанная реплика, когда Капри появляется сама. None — если модель недоступна."""

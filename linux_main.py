@@ -21,6 +21,7 @@ from PySide6.QtWidgets import QApplication, QInputDialog, QMenu, QMessageBox, QS
 from avatar import Avatar
 from linux_actions import LinuxActions
 from local_ai import LocalAI
+from speech_queue import SpeechQueue
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "capricorn"
@@ -61,6 +62,8 @@ class Bridge(QObject):
     partial_text = Signal(str)
     listener_error = Signal(str)
     answer = Signal(str)
+    speech_finished = Signal(int)
+    model_answer = Signal(str, int)
 
 
 class LocalSpeaker:
@@ -76,9 +79,20 @@ class LocalSpeaker:
         self.preset = preset if preset in VOICE_PRESETS else "piper_irina"
         self.voice = VOICE_PRESETS[self.preset]
 
+    def stop_playback(self):
+        process = self.process
+        if process and process.poll() is None:
+            try:
+                process.terminate()
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+            except ProcessLookupError:
+                pass
+
     def stop(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+        self.stop_playback()
         if self.temp_audio:
             try:
                 os.unlink(self.temp_audio)
@@ -86,9 +100,27 @@ class LocalSpeaker:
                 pass
             self.temp_audio = None
 
-    def say(self, text: str):
+    def _play(self, command, timeout, cancel):
+        if cancel.is_set():
+            return
+        self.process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + timeout
+        while self.process.poll() is None:
+            if cancel.wait(0.05) or time.monotonic() >= deadline:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+                break
+
+    def say(self, text: str, cancel):
         self.stop()
-        if self.preset == "piper_irina":
+        if cancel.is_set():
+            return
+        voice = self.voice.copy()
+        if voice.get("engine") == "piper":
             model = VOICE_DIR / "ru_RU-irina-medium.onnx"
             if not model.is_file():
                 model = ROOT / "voices" / "ru_RU-irina-medium.onnx"
@@ -104,9 +136,7 @@ class LocalSpeaker:
                     with wave.open(self.temp_audio, "wb") as wav_file:
                         self._piper_voice.synthesize_wav(
                             text, wav_file, syn_config=SynthesisConfig(volume=0.72))
-                    self.process = subprocess.Popen([player, self.temp_audio],
-                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    self.process.wait(timeout=max(20, len(text) / 3))
+                    self._play([player, self.temp_audio], max(20, len(text) / 3), cancel)
                     self.stop()
                     return
                 except Exception:
@@ -116,11 +146,9 @@ class LocalSpeaker:
             return
         self.stop()
         try:
-            self.process = subprocess.Popen([binary, "-v", self.voice["voice"], "-s", str(self.voice["rate"]),
-                                             "-p", str(self.voice["pitch"]), "-a", str(self.voice["volume"]),
-                                             "-P", "34", text],
-                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            self.process.wait(timeout=max(8, len(text) / 8))
+            self._play([binary, "-v", voice["voice"], "-s", str(voice["rate"]),
+                        "-p", str(voice["pitch"]), "-a", str(voice["volume"]),
+                        "-P", "34", text], max(8, len(text) / 8), cancel)
         except (OSError, subprocess.TimeoutExpired):
             self.stop()
 
@@ -137,10 +165,13 @@ class CapriLinux(QObject):
         self.bridge.partial_text.connect(self.on_partial)
         self.bridge.listener_error.connect(self.on_listener_error)
         self.bridge.answer.connect(self.on_answer)
+        self.bridge.model_answer.connect(self.on_model_answer)
         self.app.aboutToQuit.connect(self.shutdown)
         self.awake_until = 0.0
         self.busy = False
         self.listener = None
+        self.speech = SpeechQueue(self.speaker, self._mute, self.bridge.speech_finished.emit)
+        self.bridge.speech_finished.connect(self._speech_finished)
         self.wake = re.compile(r"\b(?:" + "|".join(re.escape(w) for w in cfg["wake_words"]) + r")\b", re.I)
 
     def start(self):
@@ -197,7 +228,7 @@ class CapriLinux(QObject):
         self.avatar.summon()
         self.avatar.set_mode("speaking", 4)
         self.avatar.set_subtitle(VOICE_PRESETS[preset]["label"].upper())
-        threading.Thread(target=self._speak, args=("Привет. Я Капри. Так звучит мягче?",), daemon=True).start()
+        self.speech.submit("Привет. Я Капри. Так звучит мягче?")
 
     def set_think_mode(self, enabled):
         self.local.think_mode = bool(enabled)
@@ -216,10 +247,15 @@ class CapriLinux(QObject):
             QMessageBox.StandardButton.No)
         if choice == QMessageBox.StandardButton.Yes:
             self.local.clear_memory()
+            self.speech.cancel()
+            self.after_speech()
             QMessageBox.information(self.avatar, "Память Capri", "Сохранённые заметки и история удалены.")
 
     def handle_text(self, text):
         if self.busy:
+            return
+        if self.local.is_clear_memory_request(text):
+            self.clear_memory()
             return
         plan = self.actions.confirmation_plan(text)
         if plan and plan.get("kind") == "error":
@@ -240,7 +276,7 @@ class CapriLinux(QObject):
             return
         if self.listener:
             self.listener.reset_req.set()
-        self.speaker.stop()
+        self.speech.cancel()
         self.busy = True
         self.avatar.summon()
         self.avatar.set_mode("thinking")
@@ -258,20 +294,26 @@ class CapriLinux(QObject):
                 self.bridge.answer.emit("__QUIT__")
                 return
             if result is None:
+                generation = self.local.memory_generation()
                 result = self.local.ask(text)
+                self.bridge.model_answer.emit(result or "Не смогла уверенно ответить. Скажи иначе или попроси поиск.", generation)
+                return
             self.bridge.answer.emit(result or "Не смогла уверенно ответить. Скажи иначе или попроси поиск.")
         except Exception as e:
             log.exception("Command failed: %s", text)
             self.bridge.answer.emit("Не получилось выполнить эту команду.")
 
-    def _speak(self, text):
+    def _mute(self, muted):
         if self.listener:
-            self.listener.muted.set()
-        self.speaker.say(text)
-        if self.listener:
-            self.listener.muted.clear()
-            self.listener.reset_req.set()
-        self.bridge.answer.emit("__IDLE__")
+            if muted:
+                self.listener.muted.set()
+            else:
+                self.listener.reset_req.set()
+                self.listener.muted.clear()
+
+    def _speech_finished(self, generation):
+        if generation == self.speech.generation and not self.busy:
+            self.after_speech()
 
     def on_listener_error(self, error):
         log.error("Speech recognition: %s", error)
@@ -283,9 +325,15 @@ class CapriLinux(QObject):
         self.avatar.set_subtitle("")
 
     def shutdown(self):
-        self.speaker.stop()
+        self.speech.close()
         if self.listener:
             self.listener.stop()
+
+    def on_model_answer(self, text, generation):
+        if generation != self.local.memory_generation():
+            self.busy = False
+            return
+        self.on_answer(text)
 
     def on_answer(self, text):
         if text == "__IDLE__":
@@ -301,7 +349,7 @@ class CapriLinux(QObject):
         self.avatar.set_subtitle(text)
         self.avatar.set_mode("speaking", min(45, max(3, len(text) / 12)))
         self.awake_until = time.time() + 7
-        threading.Thread(target=self._speak, args=(text,), daemon=True).start()
+        self.speech.submit(text)
 
 
 def load_config():

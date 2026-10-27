@@ -58,13 +58,15 @@ class LinuxListener(threading.Thread):
                 if self.reset_req.is_set():
                     recognizer.Reset()
                     self.reset_req.clear()
-                if self.muted.is_set():
-                    time.sleep(0.05)
-                    continue
+                was_muted = self.muted.is_set()
                 data = self.process.stdout.read(BLOCK_BYTES)
                 if not data:
                     if self.process.poll() is not None:
                         raise RuntimeError("PipeWire остановил запись с микрофона")
+                    continue
+                if was_muted or self.muted.is_set() or self.reset_req.is_set():
+                    recognizer.Reset()
+                    self.reset_req.clear()
                     continue
                 if recognizer.AcceptWaveform(data):
                     text = json.loads(recognizer.Result()).get("text", "").strip()
